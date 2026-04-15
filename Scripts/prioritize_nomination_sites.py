@@ -250,10 +250,12 @@ def load_uncoverseq_csv(path: Optional[str]) -> pd.DataFrame:
         df["UNCOV_ld"] = df["levenshtein_distance"].apply(_safe_float)
     else:
         df["UNCOV_ld"] = pd.NA
+    # X index: 1-based count across off-target rows that pass LD < 7 (file order)
     df["UNCOV_nonon_index"] = 0
     nonon_idx = 1
     for i in df.index:
-        if not is_on.at[i]:
+        ld_val = _safe_float(df.at[i, "UNCOV_ld"])
+        if not is_on.at[i] and ld_val is not None and ld_val < 7:
             df.at[i, "UNCOV_nonon_index"] = nonon_idx
             nonon_idx += 1
     df["site_type"] = df["Site Type"]

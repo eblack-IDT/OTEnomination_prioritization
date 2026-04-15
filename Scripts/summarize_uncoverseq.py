@@ -10,8 +10,9 @@ Filter steps (applied in order):
   2. Count per Tier value
   3. Count where Tier in {1, 2, 3}
   4. Count where Tier in {1, 2, 3}  AND  Reproducibility > 1
-  5. Count where Tier in {1, 2, 3}  AND  Reproducibility > 2
-  6. Count where Tier in {1, 2, 3}  AND  Reproducibility > 2  AND  Avg. % On-Target UMI > 0.5
+    5. Count where Tier in {1, 2, 3}  AND  Reproducibility > 1  AND  Avg. % On-Target UMI > 0.5
+    6. Count where Tier in {1, 2, 3}  AND  Reproducibility > 2
+    7. Count where Tier in {1, 2, 3}  AND  Reproducibility > 2  AND  Avg. % On-Target UMI > 0.5
 
 Usage:
     python summarize_uncoverseq.py file1.csv[,file2.csv,...] [--outdir OUTPUT_DIR]
@@ -164,6 +165,16 @@ def summarize_file(path: str) -> pd.DataFrame:
         "Count": int((mask_tier123 & mask_repro_gt1).sum()),
     })
 
+    if ontar_col:
+        mask_ontar_gt05 = df_filt["_ontar"].notna() & (df_filt["_ontar"] > 0.5)
+    else:
+        mask_ontar_gt05 = pd.Series(False, index=df_filt.index)
+
+    rows.append({
+        "Filter": "Tier = 1, 2, or 3 & Reproducibility > 1 & Avg. % On-Target UMI > 0.5",
+        "Count": int((mask_tier123 & mask_repro_gt1 & mask_ontar_gt05).sum()),
+    })
+
     # Tier 1–3  &  Reproducibility > 2
     if repro_col:
         mask_repro_gt2 = df_filt["_repro"].notna() & (df_filt["_repro"] > 2)
@@ -174,12 +185,6 @@ def summarize_file(path: str) -> pd.DataFrame:
         "Filter": "Tier = 1, 2, or 3 & Reproducibility > 2",
         "Count": int((mask_tier123 & mask_repro_gt2).sum()),
     })
-
-    # Tier 1–3  &  Reproducibility > 2  &  Avg. % On-Target UMI > 0.5
-    if ontar_col:
-        mask_ontar_gt05 = df_filt["_ontar"].notna() & (df_filt["_ontar"] > 0.5)
-    else:
-        mask_ontar_gt05 = pd.Series(False, index=df_filt.index)
 
     rows.append({
         "Filter": "Tier = 1, 2, or 3 & Reproducibility > 2 & Avg. % On-Target UMI > 0.5",
