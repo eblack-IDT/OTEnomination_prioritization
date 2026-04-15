@@ -9,8 +9,7 @@ Naming convention
   {gRNA}_Tier{N}_{X}
     gRNA  – label supplied via --grna_names (one per file, same order as --uncoverseq)
     N     – Tier number from the source file
-    X     – 1-based sequential off-target index in the original file order (before LD filter),
-            matching the UNCOV_nonon_index convention from the base pipeline
+        X     – 1-based sequential off-target index in the original file order after LD < 7
   ON-target rows are named {gRNA}_OnT.
   Sites detected by more than one gRNA (same chr/start/stop/strand) are merged:
     Name  = {gRNA1}_...__{gRNA2}_... (capped at 50 chars → coord fallback)
@@ -57,47 +56,472 @@ Usage
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
-import sys
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# Shared infrastructure — import from the base pipeline script
-# ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from prioritize_nomination_sites import (  # noqa: E402
-    MAX_MERGED_NAME_LEN,
-    Component,
-    Record,
-    _build_location,
-    _canonicalize_columns,
-    _component_sort_key,
-    _ensure_str_col,
-    _parse_repro,
-    _read_table_auto,
-    _recompute_aggregates_from_components,
-    _safe_float,
-    _safe_int,
-    _semi_join,
-    _tier_final_from_components,
-    build_dedup_nonmerged_prioritized_rows,
-    merge_adjacent_records,
-    merge_duplicate_coords,
-    write_assay_mapping,
-    write_bed,
-    write_bed6,
-)
-
-import argparse  # noqa: E402 (after sys.path manipulation)
-
-# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 MAX_SITES = 200
+MAX_MERGED_NAME_LEN = 50
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers (inlined to keep this script independent)
+# ---------------------------------------------------------------------------
+def _read_table_auto(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, sep=None, engine="python", dtype=str, keep_default_na=False)
+    df.columns = [c.encode("utf-8-sig").decode("utf-8-sig").strip() for c in df.columns]
+    return df
+
+
+def _canonicalize_columns(df: pd.DataFrame, rename_map: dict) -> pd.DataFrame:
+    token_to_original = {}
+    for c in df.columns:
+        token = "".join(c.lower().split())
+        token_to_original[token] = c
+    for token, canonical in rename_map.items():
+        if token in token_to_original:
+            orig = token_to_original[token]
+            if orig != canonical:
+                df.rename(columns={orig: canonical}, inplace=True)
+    return df
+
+
+def _safe_int(v, default=None):
+    try:
+        if pd.isna(v):
+            return default
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+
+def _safe_float(v, default=None):
+    try:
+        if pd.isna(v):
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _ensure_str_col(df: pd.DataFrame, col: str, default: str = "") -> None:
+    if col in df.columns:
+        df[col] = df[col].astype(str)
+    else:
+        df[col] = pd.Series([default] * len(df), index=df.index)
+
+
+def _parse_repro(v) -> Optional[int]:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    try:
+        n = int(str(v).strip())
+        return n if 1 <= n <= 3 else None
+    except Exception:
+        return None
+
+
+def _build_location(chr_: str, start: int, stop: int, strand: str) -> str:
+    s = (strand or ".")
+    try:
+        return f"{chr_}:{int(start)}-{int(stop)}({s})"
+    except Exception:
+        return f"{chr_}:{start}-{stop}({s})"
+
+
+@dataclass
+class Component:
+    source: str
+    site_type: str
+    raw_name: str
+    cust_name: Optional[str] = None
+    cust_nonon_index: Optional[int] = None
+    cust_input_order: Optional[int] = None
+    uncov_tier: Optional[int] = None
+    uncov_nonon_index: Optional[int] = None
+    uncov_input_order: Optional[int] = None
+    uncov_ld: Optional[float] = None
+    uncov_repro: Optional[int] = None
+    ins_index: Optional[int] = None
+    ins_ld: Optional[float] = None
+    ins_tier: Optional[int] = None
+    ins_mar_rank: Optional[int] = None
+    gam_region: Optional[str] = None
+    orig_chr: Optional[str] = None
+    orig_start: Optional[int] = None
+    orig_stop: Optional[int] = None
+    orig_strand: Optional[str] = None
+    name: Optional[str] = None
+    location: Optional[str] = None
+    lev_dist: Optional[str] = None
+    gene: Optional[str] = None
+    annot: Optional[str] = None
+    pool: Optional[str] = None
+    mar_str: Optional[str] = None
+    tier_str: Optional[str] = None
+    avg_pct_on_target_umi: Optional[str] = None
+
+    def display_token(self) -> str:
+        s = self.source
+        if s == "customer":
+            if self.cust_name:
+                return f"Customer_{self.cust_name}"
+            if self.cust_nonon_index:
+                return f"Customer_OT{self.cust_nonon_index}"
+            return "Customer"
+        if s == "UNCOVERseq":
+            y = self.uncov_tier if self.uncov_tier is not None else 9
+            x = self.uncov_nonon_index if self.uncov_nonon_index is not None else 0
+            return f"Tier{y}_{x}"
+        if s == "insilico_pop":
+            return f"Insilico_pop{self.ins_index or 0}"
+        if s == "insilico_ref":
+            return f"Insilico_ref{self.ins_index or 0}"
+        return s
+
+
+@dataclass
+class Record:
+    chr: str
+    start: int
+    stop: int
+    strand: str
+    name_tokens: List[str]
+    name_list: List[str]
+    sources_present: Set[str]
+    components: List[Component]
+    is_on: bool = False
+    uncov_present: bool = False
+    uncov_is_on: bool = False
+    uncov_tier: Optional[int] = None
+    uncov_nonon_index: Optional[int] = None
+    uncov_min_order: Optional[int] = None
+    uncov_ld: Optional[float] = None
+    uncov_repro: Optional[int] = None
+    customer_present: bool = False
+    customer_is_on: bool = False
+    customer_nonon_index: Optional[int] = None
+    customer_name: Optional[str] = None
+    cust_min_order: Optional[int] = None
+    ins_pop_present: bool = False
+    ins_pop_index: Optional[int] = None
+    ins_ref_present: bool = False
+    ins_ref_index: Optional[int] = None
+    ins_ld_min: Optional[float] = None
+    ins_tier_min: Optional[int] = None
+    ins_mar_rank_min: Optional[int] = None
+    ins_ld3_exon: bool = False
+
+    def bed_row(self) -> List[str]:
+        name = "_".join([t for t in self.name_tokens if t])
+        return [self.chr, str(self.start), str(self.stop), name, "0", (self.strand or ".")]
+
+
+def _final_name_from_record(r: Record) -> str:
+    return "_".join([t for t in r.name_tokens if t])
+
+
+def _recompute_aggregates_from_components(r: Record) -> None:
+    comps = r.components or []
+    r.sources_present = set(c.source for c in comps)
+    r.is_on = any(bool(re.search(r"\bon\b", (c.site_type or "").lower())) for c in comps)
+    r.uncov_present = any(c.source == "UNCOVERseq" for c in comps)
+    r.uncov_is_on = any((c.source == "UNCOVERseq") and bool(re.search(r"\bon\b", (c.site_type or "").lower())) for c in comps)
+    uncov_tiers = [c.uncov_tier for c in comps if c.uncov_tier is not None]
+    r.uncov_tier = min(uncov_tiers) if uncov_tiers else None
+    uncov_nonon = [c.uncov_nonon_index for c in comps if c.uncov_nonon_index]
+    r.uncov_nonon_index = min(uncov_nonon) if uncov_nonon else None
+    uncov_orders = [c.uncov_input_order for c in comps if c.uncov_input_order is not None]
+    r.uncov_min_order = min(uncov_orders) if uncov_orders else None
+    uncov_ld = [c.uncov_ld for c in comps if c.uncov_ld is not None]
+    r.uncov_ld = min(uncov_ld) if uncov_ld else None
+    uncov_repro = [c.uncov_repro for c in comps if c.uncov_repro is not None]
+    r.uncov_repro = max(uncov_repro) if uncov_repro else None
+    r.customer_present = any(c.source == "customer" for c in comps)
+    r.customer_is_on = any((c.source == "customer") and bool(re.search(r"\bon\b", (c.site_type or "").lower())) for c in comps)
+    cust_nonon = [c.cust_nonon_index for c in comps if c.cust_nonon_index]
+    r.customer_nonon_index = min(cust_nonon) if cust_nonon else None
+    cust_orders = [c.cust_input_order for c in comps if c.cust_input_order is not None]
+    r.cust_min_order = min(cust_orders) if cust_orders else None
+    cust_names = [c.cust_name for c in comps if c.cust_name]
+    r.customer_name = cust_names[0] if cust_names else None
+    r.ins_pop_present = any(c.source == "insilico_pop" for c in comps)
+    r.ins_ref_present = any(c.source == "insilico_ref" for c in comps)
+    pop_idx = [c.ins_index for c in comps if c.source == "insilico_pop" and c.ins_index is not None]
+    ref_idx = [c.ins_index for c in comps if c.source == "insilico_ref" and c.ins_index is not None]
+    r.ins_pop_index = min(pop_idx) if pop_idx else None
+    r.ins_ref_index = min(ref_idx) if ref_idx else None
+    ins_ld = [c.ins_ld for c in comps if c.ins_ld is not None]
+    r.ins_ld_min = min(ins_ld) if ins_ld else None
+    ins_tier = [c.ins_tier for c in comps if c.ins_tier is not None]
+    r.ins_tier_min = min(ins_tier) if ins_tier else None
+    ins_mar = [c.ins_mar_rank for c in comps if c.ins_mar_rank is not None]
+    r.ins_mar_rank_min = min(ins_mar) if ins_mar else None
+    r.ins_ld3_exon = any((c.ins_ld == 3) and (str(getattr(c, "gam_region", "")).strip().lower() == "exon") for c in comps)
+
+
+def _merge_two_records(prev: Record, curr: Record, name_delim: str) -> Record:
+    chr_ = prev.chr
+    start = min(prev.start, curr.start)
+    has_customer = prev.customer_present or curr.customer_present
+    has_insilico = (prev.ins_pop_present or prev.ins_ref_present or curr.ins_pop_present or curr.ins_ref_present)
+    if prev.start == curr.start and has_customer and has_insilico:
+        stop = min(prev.stop, curr.stop)
+    else:
+        stop = curr.stop
+    strand = prev.strand if prev.strand == curr.strand else "."
+    left = _final_name_from_record(prev)
+    right = _final_name_from_record(curr)
+    merged_name = f"{left}{name_delim}{right}" if left and right else (left or right or "unknown")
+    if len(merged_name) > MAX_MERGED_NAME_LEN:
+        merged_name = f"{chr_}:{start}-{stop}"
+    merged_name_list = (prev.name_list or []) + (curr.name_list or [])
+    merged = Record(chr_, start, stop, strand,
+                    name_tokens=[merged_name],
+                    name_list=merged_name_list,
+                    sources_present=set(),
+                    components=(prev.components + curr.components))
+    _recompute_aggregates_from_components(merged)
+    return merged
+
+
+def merge_adjacent_records(all_records: List[Record],
+                           target_distance: int,
+                           max_insert: int = 200,
+                           target_flank: int = 40,
+                           max_merge_size: Optional[int] = None,
+                           name_delim: str = "__") -> List[Record]:
+    if not all_records:
+        return all_records
+    if max_merge_size is None:
+        max_merge_size = max_insert - target_flank - 15
+    recs = sorted(all_records, key=lambda r: (r.chr, r.start, r.stop))
+    out: List[Record] = []
+    prev: Optional[Record] = None
+    for curr in recs:
+        if prev is None:
+            prev = curr
+            continue
+        if curr.chr == prev.chr:
+            gap = int(curr.start) - int(prev.stop)
+            merged_len = int(curr.stop) - int(prev.start)
+            if gap < target_distance and merged_len <= max_merge_size:
+                prev = _merge_two_records(prev, curr, name_delim)
+                continue
+            out.append(prev)
+            prev = curr
+        else:
+            out.append(prev)
+            prev = curr
+    if prev is not None:
+        out.append(prev)
+    return out
+
+
+def merge_duplicate_coords(all_records: List[Record], name_delim: str = ";") -> List[Record]:
+    if not all_records:
+        return all_records
+    from collections import defaultdict
+    groups: Dict[Tuple[str, int, int, str], List[Record]] = defaultdict(list)
+    for r in all_records:
+        groups[(r.chr, r.start, r.stop, r.strand or ".")].append(r)
+    out: List[Record] = []
+    for (chr_, start, stop, strand), items in groups.items():
+        if len(items) == 1:
+            out.append(items[0])
+            continue
+        base = items[0]
+        for nxt in items[1:]:
+            base = _merge_two_records(base, nxt, name_delim)
+            base.chr, base.start, base.stop, base.strand = chr_, start, stop, strand
+        out.append(base)
+    return out
+
+
+def write_bed(path: str, recs: List[Record]) -> int:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    count = 0
+    with open(path, "w") as f:
+        for r in recs:
+            f.write("\t".join(r.bed_row()) + "\n")
+            count += 1
+    return count
+
+
+def build_dedup_nonmerged_prioritized_rows(prioritized: list) -> list:
+    rows = []
+    seen = set()
+
+    def comp_is_on(c):
+        st = (c.site_type or "").lower()
+        return bool(re.search(r"\bon\b", st))
+
+    for r in prioritized:
+        for c in (r.components or []):
+            chr_ = c.orig_chr or r.chr
+            start = c.orig_start if c.orig_start is not None else r.start
+            stop = c.orig_stop if c.orig_stop is not None else r.stop
+            strand = (c.orig_strand or r.strand or ".")
+
+            key = (chr_, int(start), int(stop), strand)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if comp_is_on(c):
+                orig_name = "OnT"
+            elif c.source == "UNCOVERseq":
+                t = c.uncov_tier if c.uncov_tier is not None else 9
+                x = c.uncov_nonon_index if c.uncov_nonon_index is not None else 0
+                orig_name = f"Tier{t}_{x}"
+            elif c.source == "customer":
+                if c.cust_name and str(c.cust_name).strip() != "":
+                    orig_name = f"Customer_{c.cust_name}"
+                else:
+                    x = c.cust_nonon_index if c.cust_nonon_index is not None else 0
+                    orig_name = f"Customer_OT{x}"
+            elif c.source == "insilico_pop":
+                orig_name = f"Insilico_pop{c.ins_index or 0}"
+            elif c.source == "insilico_ref":
+                orig_name = f"Insilico_ref{c.ins_index or 0}"
+            else:
+                try:
+                    orig_name = c.display_token()
+                except Exception:
+                    orig_name = c.raw_name or "orig"
+
+            rows.append([chr_, str(int(start)), str(int(stop)), orig_name, "0", strand])
+
+    return rows
+
+
+def write_bed6(path: str, rows: list) -> int:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    n = 0
+    with open(path, "w") as f:
+        for r in rows:
+            line = "\t".join([str(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5])])
+            f.write(line + "\n")
+            n += 1
+    return n
+
+
+def _semi_join(values: List[Optional[str]]) -> str:
+    normed = []
+    for v in values:
+        s = "" if v is None else str(v)
+        s = s.strip()
+        normed.append("NONE" if s == "" else s)
+    uniq = set(normed)
+    if len(uniq) == 1:
+        return next(iter(uniq))
+    return ";".join(normed)
+
+
+def _origin_display(source: str) -> str:
+    if source.startswith("insilico"):
+        return "insilico"
+    return source
+
+
+def _component_sort_key(c: Component) -> int:
+    s = c.source or ""
+    if s == "UNCOVERseq":
+        return 0
+    if s.startswith("insilico"):
+        return 1
+    if s == "customer":
+        return 2
+    return 9
+
+
+def _tier_final_from_components(comps: List[Component]) -> str:
+    vals = []
+    for c in comps:
+        if c.tier_str is None:
+            continue
+        s = str(c.tier_str).strip()
+        try:
+            n = int(s)
+            vals.append(n)
+        except Exception:
+            try:
+                n = int(s.split()[-1])
+                vals.append(n)
+            except Exception:
+                continue
+    if not vals:
+        return "NONE"
+    return str(min(vals))
+
+
+def write_assay_mapping(path: str, recs: List[Record]) -> int:
+    import csv
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    headers = [
+        "chr", "start", "stop", "strand",
+        "Name", "Location", "Lev. Dist.", "Gene", "Annot.", "Pool",
+        "MAR", "Tier", "Tier_Final", "Site Type", "Origin", "Avg. % On-Target UMI",
+        "orig_chr", "orig_start", "orig_stop", "orig_strand", "orig_Name",
+    ]
+    n = 0
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in recs:
+            comps = sorted(r.components, key=_component_sort_key)
+            final_name = "_".join([t for t in r.name_tokens if t])
+            name_uncapped = ";".join([s for s in (r.name_list or []) if s is not None and str(s).strip() != ""])
+
+            locs = [c.location for c in comps]
+            levd = [c.lev_dist for c in comps]
+            genes = [c.gene for c in comps]
+            annots = [c.annot for c in comps]
+            pools = [c.pool for c in comps]
+            mars = [c.mar_str for c in comps]
+            tiers = [c.tier_str for c in comps]
+            stypes = [c.site_type for c in comps]
+            origins = [_origin_display(c.source or "") for c in comps]
+            avg_pct = [c.avg_pct_on_target_umi for c in comps]
+            o_chr = [c.orig_chr for c in comps]
+            o_start = [str(c.orig_start) if c.orig_start is not None else None for c in comps]
+            o_stop = [str(c.orig_stop) if c.orig_stop is not None else None for c in comps]
+            o_strand = [c.orig_strand for c in comps]
+
+            row = [
+                r.chr, r.start, r.stop, (r.strand or "."),
+                final_name,
+                _semi_join(locs),
+                _semi_join(levd),
+                _semi_join(genes),
+                _semi_join(annots),
+                _semi_join(pools),
+                _semi_join(mars),
+                _semi_join(tiers),
+                _tier_final_from_components(comps),
+                _semi_join(stypes),
+                _semi_join(origins),
+                _semi_join(avg_pct),
+                _semi_join(o_chr),
+                _semi_join(o_start),
+                _semi_join(o_stop),
+                _semi_join(o_strand),
+                name_uncapped if name_uncapped else final_name,
+            ]
+            w.writerow(row)
+            n += 1
+    return n
 
 
 # ---------------------------------------------------------------------------
