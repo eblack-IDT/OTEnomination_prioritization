@@ -346,8 +346,10 @@ class Component:
             else:
                 return "Customer"
         elif s == "UNCOVERseq":
+            if bool(re.search(r"\bon\b", str(self.site_type or "").lower())):
+                return "OnT"
             y = self.uncov_tier if self.uncov_tier is not None else 9
-            x = self.uncov_nonon_index if self.uncov_nonon_index is not None else 0
+            x = self.uncov_nonon_index if self.uncov_nonon_index is not None else 1
             return f"Tier{y}_{x}"
         elif s == "insilico_pop":
             return f"Insilico_pop{self.ins_index or 0}"
@@ -410,6 +412,13 @@ def merge_sources(df_customer: pd.DataFrame,
         site_type_val = str(row.get("site_type",""))
         is_on = bool(re.search(r"\bon\b", site_type_val.lower()))
         tier = _safe_int(row.get("Tier", row.get("Tier_num", pd.NA)), None)
+
+        # Defensive guard: UNCOVERseq rows with missing/LD>=7 must never contribute
+        # to downstream naming or assay mapping, even if they bypassed loader filtering.
+        if label == "UNCOVERseq":
+            ld_uncov_guard = _safe_float(row.get("UNCOV_ld", row.get("Levenshtein Distance", pd.NA)), None)
+            if ld_uncov_guard is None or ld_uncov_guard >= 7:
+                return
 
         if dedupe_mode == "none":
             rec = Record(key[0], key[1], key[2], key[3],
@@ -568,7 +577,7 @@ def merge_sources(df_customer: pd.DataFrame,
         else:
             if r.uncov_present:
                 tier_val = r.uncov_tier if r.uncov_tier is not None else 9
-                x = r.uncov_nonon_index if r.uncov_nonon_index is not None else 0
+                x = r.uncov_nonon_index if r.uncov_nonon_index is not None else 1
                 base = f"Tier{tier_val}_{x}"
                 tokens = [base]
                 if r.customer_present and not r.customer_is_on:
@@ -905,7 +914,7 @@ def build_dedup_nonmerged_prioritized_rows(prioritized: list) -> list:
                 orig_name = "OnT"
             elif c.source == "UNCOVERseq":
                 t = c.uncov_tier if c.uncov_tier is not None else 9
-                x = c.uncov_nonon_index if c.uncov_nonon_index is not None else 0
+                x = c.uncov_nonon_index if c.uncov_nonon_index is not None else 1
                 orig_name = f"Tier{t}_{x}"
             elif c.source == "customer":
                 if c.cust_name and str(c.cust_name).strip() != "":
@@ -1029,11 +1038,25 @@ def write_assay_mapping(path: str, recs: List[Record]) -> int:
         w.writerow(headers)
         for r in recs:
             comps = sorted(r.components, key=_component_sort_key)
+            # Defensive guard for assay mapping: include UNCOVERseq components only when LD < 7.
+            comps = [
+                c for c in comps
+                if c.source != "UNCOVERseq" or (c.uncov_ld is not None and c.uncov_ld < 7)
+            ]
+            if not comps:
+                continue
 
             # Final bed name (4th BED column, possibly capped to <=50 chars or replaced by span)
             final_name = "_".join([t for t in r.name_tokens if t])
-            # Provenance tokens for orig_Name (semicolon-joined)
-            name_uncapped = ";".join([s for s in (r.name_list or []) if s is not None and str(s).strip() != ""])
+            # Provenance tokens for orig_Name (semicolon-joined), rebuilt from filtered components.
+            name_tokens = []
+            seen_tokens = set()
+            for c in comps:
+                tok = c.display_token()
+                if tok and tok not in seen_tokens:
+                    name_tokens.append(tok)
+                    seen_tokens.add(tok)
+            name_uncapped = ";".join(name_tokens)
 
             # Collect per-field lists in the specified order
             locs       = [c.location for c in comps]
