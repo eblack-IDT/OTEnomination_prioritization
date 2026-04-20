@@ -6,10 +6,11 @@ Multi-gRNA UNCOVERseq prioritization — all input files carry equal weight.
 
 Naming convention
 -----------------
-  {gRNA}_Tier{N}_{X}
-    gRNA  – label supplied via --grna_names (one per file, same order as --uncoverseq)
-    N     – Tier number from the source file
-        X     – 1-based sequential off-target index in the original file order after LD < 7
+    {gRNA}_Tier{N}_{X}
+        gRNA  – label supplied via --grna_names (one per file, same order as --uncoverseq)
+        N     – Tier number from the source file
+        X     – 1-based sequential off-target index across all off-target rows in that
+                        input file after LD < 7 filtering, matching the base pipeline convention
   ON-target rows are named {gRNA}_OnT.
   Sites detected by more than one gRNA (same chr/start/stop/strand) are merged:
     Name  = {gRNA1}_...__{gRNA2}_... (capped at 50 chars → coord fallback)
@@ -231,6 +232,36 @@ def _final_name_from_record(r: Record) -> str:
     return "_".join([t for t in r.name_tokens if t])
 
 
+def _ordered_raw_names_from_components(comps: List[Component]) -> List[str]:
+    ordered = sorted(
+        comps,
+        key=lambda c: (
+            0 if c.source == "UNCOVERseq" else 1,
+            c.uncov_input_order if c.uncov_input_order is not None else 10 ** 9,
+            c.orig_chr or "",
+            c.orig_start if c.orig_start is not None else 10 ** 9,
+            c.orig_stop if c.orig_stop is not None else 10 ** 9,
+            c.raw_name or "",
+        ),
+    )
+    seen_parts: Set[str] = set()
+    parts: List[str] = []
+    for c in ordered:
+        n = (c.raw_name or "").strip()
+        if n and n not in seen_parts:
+            parts.append(n)
+            seen_parts.add(n)
+    return parts
+
+
+def _joined_name_from_components(comps: List[Component], chr_: str, start: int, stop: int, name_delim: str) -> Tuple[str, List[str]]:
+    parts = _ordered_raw_names_from_components(comps)
+    joined = name_delim.join(parts) if parts else "unknown"
+    if len(joined) > MAX_MERGED_NAME_LEN:
+        joined = f"{chr_}:{start}-{stop}"
+    return joined, parts
+
+
 def _recompute_aggregates_from_components(r: Record) -> None:
     comps = r.components or []
     r.sources_present = set(c.source for c in comps)
@@ -280,17 +311,15 @@ def _merge_two_records(prev: Record, curr: Record, name_delim: str) -> Record:
     else:
         stop = curr.stop
     strand = prev.strand if prev.strand == curr.strand else "."
-    left = _final_name_from_record(prev)
-    right = _final_name_from_record(curr)
-    merged_name = f"{left}{name_delim}{right}" if left and right else (left or right or "unknown")
-    if len(merged_name) > MAX_MERGED_NAME_LEN:
-        merged_name = f"{chr_}:{start}-{stop}"
-    merged_name_list = (prev.name_list or []) + (curr.name_list or [])
+    merged_components = prev.components + curr.components
+    merged_name, merged_name_list = _joined_name_from_components(
+        merged_components, chr_, start, stop, name_delim
+    )
     merged = Record(chr_, start, stop, strand,
                     name_tokens=[merged_name],
                     name_list=merged_name_list,
                     sources_present=set(),
-                    components=(prev.components + curr.components))
+                    components=merged_components)
     _recompute_aggregates_from_components(merged)
     return merged
 
@@ -610,18 +639,27 @@ def _load_one_uncov(path: str, grna_name: str) -> pd.DataFrame:
     else:
         df["UNCOV_ld"] = None
 
+    # Hard filter UNCOVERseq to LD < 7 so LD>=7/missing rows never appear downstream.
+    # Keep the original surviving file order and use that order for naming/prioritization.
+    pass_ld = df["UNCOV_ld"].notna() & (df["UNCOV_ld"] < 7)
+    df.attrs["uncov_ld_lt7_count"] = int(pass_ld.sum())
+    df.attrs["uncov_ld_ge7_or_missing_count"] = int((~pass_ld).sum())
+    df = df.loc[pass_ld].copy().reset_index(drop=True)
+    df["__input_order__"] = range(1, len(df) + 1)
+
     if "Avg. % On-Target UMI" not in df.columns:
         df["Avg. % On-Target UMI"] = None
 
-    # X index: 1-based count across off-target rows that pass LD < 7 (file order)
+    # X index: 1-based count across all off-target rows in LD-filtered file order,
+    # matching the base pipeline UNCOVERseq convention on a per-input-file basis.
     is_on = df["Site Type"].str.contains(r"\bon\b", case=False, na=False)
     df["UNCOV_nonon_index"] = 0
-    idx = 1
+    nonon_idx = 1
     for i in df.index:
-        ld_val = _safe_float(df.at[i, "UNCOV_ld"])
-        if not is_on.at[i] and ld_val is not None and ld_val < 7:
-            df.at[i, "UNCOV_nonon_index"] = idx
-            idx += 1
+        if is_on.at[i]:
+            continue
+        df.at[i, "UNCOV_nonon_index"] = nonon_idx
+        nonon_idx += 1
 
     # Canonical site name
     def _site_name(row) -> str:
@@ -767,18 +805,12 @@ def _build_records(
     # Use raw_name from each component ({gRNA}_Tier{N}_{X} or {gRNA}_OnT).
     # Multi-source sites join tokens with '__'.
     for r in all_records:
-        seen_parts: Set[str] = set()
-        parts: List[str] = []
-        for c in r.components:
-            n = (c.raw_name or "").strip()
-            if n and n not in seen_parts:
-                parts.append(n)
-                seen_parts.add(n)
+        parts = _ordered_raw_names_from_components(r.components)
         joined = "__".join(parts) if parts else ("OnT" if r.is_on else "unknown")
         if len(joined) > MAX_MERGED_NAME_LEN:
             joined = f"{r.chr}:{r.start}-{r.stop}"
         r.name_tokens = [joined]
-        r.name_list   = [joined]
+        r.name_list   = parts if parts else [joined]
 
     on_records = [r for r in all_records if r.is_on]
     return all_records, on_records
@@ -788,23 +820,16 @@ def _build_records(
 # Prioritization — three-pass
 # ---------------------------------------------------------------------------
 
-def _sort_key(r: Record) -> tuple:
-    """Primary: LD ↑  Secondary: minimum row-order across files ↑"""
-    ld    = r.uncov_ld        if r.uncov_ld        is not None else 999.0
-    order = r.uncov_min_order if r.uncov_min_order is not None else 10 ** 9
-    return (ld, order)
-
-
 def prioritize_ssll(
     all_recs: List[Record],
     max_sites: int,
 ) -> Tuple[List[Record], List[Record]]:
     """
     Pass 0: ON-target   (no LD restriction, always included)
-    Pass 1: Tier ∈ {1, 2}                      | LD < 7  (only if total < max_sites)
-    Pass 2: Tier=3 & Repro>2 & Avg%UMI>0.5    | LD < 7  (only if total < max_sites)
-    Pass 3: Tier=3 & Repro>1 & Avg%UMI>0.5    | LD < 7  (only if total < max_sites)
-    Pass 4: all remaining LD < 7 sites         |         (only if total < max_sites)
+    Pass 1: Tier ∈ {1, 2}                      | LD < 7  (filtered file order)
+    Pass 2: Tier=3 & Repro>2 & Avg%UMI>0.5    | LD < 7  (filtered file order)
+    Pass 3: Tier=3 & Repro>1 & Avg%UMI>0.5    | LD < 7  (filtered file order)
+    Pass 4: all remaining LD < 7 sites         |         (filtered file order)
     """
     selected: List[Record] = []
     seen: Set[tuple] = set()
@@ -812,8 +837,12 @@ def prioritize_ssll(
     def _key(r: Record) -> tuple:
         return (r.chr, r.start, r.stop, r.strand)
 
+    def _input_order_key(r: Record) -> tuple:
+        order = r.uncov_min_order if r.uncov_min_order is not None else 10 ** 9
+        return (order, r.chr, r.start, r.stop, r.strand)
+
     def add_pass(pool: List[Record]) -> None:
-        for r in sorted(pool, key=_sort_key):
+        for r in sorted(pool, key=_input_order_key):
             if len(selected) >= max_sites:
                 break
             k = _key(r)
