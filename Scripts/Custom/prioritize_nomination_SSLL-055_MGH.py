@@ -181,12 +181,12 @@ class Component:
             return "Customer"
         if s == "UNCOVERseq":
             y = self.uncov_tier if self.uncov_tier is not None else 9
-            x = self.uncov_nonon_index if self.uncov_nonon_index is not None else 0
+            x = self.uncov_nonon_index if (self.uncov_nonon_index is not None and self.uncov_nonon_index > 0) else 1
             return f"Tier{y}_{x}"
         if s == "insilico_pop":
-            return f"Insilico_pop{self.ins_index or 0}"
+            return f"Insilico_pop{self.ins_index or 1}"
         if s == "insilico_ref":
-            return f"Insilico_ref{self.ins_index or 0}"
+            return f"Insilico_ref{self.ins_index or 1}"
         return s
 
 
@@ -382,18 +382,18 @@ def build_dedup_nonmerged_prioritized_rows(prioritized: list) -> list:
                 orig_name = "OnT"
             elif c.source == "UNCOVERseq":
                 t = c.uncov_tier if c.uncov_tier is not None else 9
-                x = c.uncov_nonon_index if c.uncov_nonon_index is not None else 0
+                x = c.uncov_nonon_index if (c.uncov_nonon_index is not None and c.uncov_nonon_index > 0) else 1
                 orig_name = f"Tier{t}_{x}"
             elif c.source == "customer":
                 if c.cust_name and str(c.cust_name).strip() != "":
                     orig_name = f"Customer_{c.cust_name}"
                 else:
-                    x = c.cust_nonon_index if c.cust_nonon_index is not None else 0
+                    x = c.cust_nonon_index if c.cust_nonon_index is not None else 1
                     orig_name = f"Customer_OT{x}"
             elif c.source == "insilico_pop":
-                orig_name = f"Insilico_pop{c.ins_index or 0}"
+                orig_name = f"Insilico_pop{c.ins_index or 1}"
             elif c.source == "insilico_ref":
-                orig_name = f"Insilico_ref{c.ins_index or 0}"
+                orig_name = f"Insilico_ref{c.ins_index or 1}"
             else:
                 try:
                     orig_name = c.display_token()
@@ -629,7 +629,8 @@ def _load_one_uncov(path: str, grna_name: str) -> pd.DataFrame:
             return f"{grna_name}_OnT"
         tier = _safe_int(row.get("Tier_num"))
         n = tier if tier is not None else 9
-        x = int(row.get("UNCOV_nonon_index", 0))
+        x_raw = _safe_int(row.get("UNCOV_nonon_index"), 1)
+        x = x_raw if (x_raw is not None and x_raw > 0) else 1
         return f"{grna_name}_Tier{n}_{x}"
 
     df["site_name"]  = df.apply(_site_name, axis=1)

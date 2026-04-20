@@ -291,20 +291,17 @@ def load_uncoverseq_csv(path: Optional[str]) -> pd.DataFrame:
         df["UNCOV_ld"] = df["levenshtein_distance"].apply(_safe_float)
     else:
         df["UNCOV_ld"] = pd.NA
-    # Assign __input_order__ and UNCOV_nonon_index only on rows that pass LD < 7
+    # Hard filter UNCOVERseq to LD < 7 so LD>=7/missing rows never appear in downstream outputs.
     pass_ld = df["UNCOV_ld"].notna() & (df["UNCOV_ld"] < 7)
     df.attrs["uncov_ld_lt7_count"] = int(pass_ld.sum())
     df.attrs["uncov_ld_ge7_or_missing_count"] = int((~pass_ld).sum())
-    df["__input_order__"] = None
-    input_idx = 1
-    for i in df.index:
-        if pass_ld.at[i]:
-            df.at[i, "__input_order__"] = input_idx
-            input_idx += 1
+    df = df.loc[pass_ld].copy()
+    is_on = df["Site Type"].str.contains(r"\bon\b", case=False, na=False)
+    df["__input_order__"] = range(1, len(df) + 1)
     df["UNCOV_nonon_index"] = None
     nonon_idx = 1
     for i in df.index:
-        if pass_ld.at[i] and not is_on.at[i]:
+        if not is_on.at[i]:
             df.at[i, "UNCOV_nonon_index"] = nonon_idx
             nonon_idx += 1
     df["site_type"] = df["Site Type"]
