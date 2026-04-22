@@ -116,6 +116,18 @@ def resolve_output_path(mapping_path: Path, output_arg: Path | None) -> Path:
     return resolved_output
 
 
+def build_singleton_pcr2_pool(mapping_df: pd.DataFrame) -> pd.Series:
+    if "Singleton_PCR2_pool" in mapping_df.columns:
+        singleton_values = mapping_df["Singleton_PCR2_pool"].astype(str)
+    else:
+        singleton_values = pd.Series("", index=mapping_df.index, dtype=str)
+
+    return singleton_values.where(
+        mapping_df["Pool"] == POOL_BY_PREFIX["sc"],
+        "NA",
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -154,6 +166,7 @@ def main() -> None:
         return "; ".join(labels)
 
     mapping_df["Pool"] = mapping_df["Name"].apply(map_pool)
+    mapping_df["Singleton_PCR2_pool"] = build_singleton_pcr2_pool(mapping_df)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     mapping_df.to_csv(out_path, index=False, encoding="utf-8")
