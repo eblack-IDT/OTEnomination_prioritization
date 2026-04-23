@@ -137,6 +137,9 @@ def _norm_mar(v: Optional[str]) -> str:
         return "Med." if t in ("Med", "Medium") else t
     return "Low"
 
+def _is_true_text(v: Optional[str]) -> bool:
+    return str(v or "").strip().upper() == "TRUE"
+
 def _ensure_str_col(df: pd.DataFrame, col: str, default: str = "") -> None:
     if col in df.columns:
         df[col] = df[col].astype(str)
@@ -188,7 +191,7 @@ def load_changeseq_be_csv(path: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "chr","start","stop","strand","site_type","raw_name","cust_name",
             "source","CUST_nonon_index","__cust_input_order__",
-            "CSEQ_avg_reads","CSEQ_edit_distance"
+            "CSEQ_avg_reads","CSEQ_edit_distance","ABE_STATS_significance"
         ])
 
     df = _read_table_auto(path)
@@ -229,10 +232,14 @@ def load_changeseq_be_csv(path: Optional[str]) -> pd.DataFrame:
     ed_col = _find_first_col_by_token_prefix(df, ["edit_distance", "editdistance"])
     df["CSEQ_edit_distance"] = df[ed_col].apply(_safe_float) if ed_col else pd.NA
 
-    # Highest avg reads first, then lowest edit distance.
+    if "ABE_STATS_significance" not in df.columns:
+        df["ABE_STATS_significance"] = ""
+    df["CSEQ_abe_true"] = df["ABE_STATS_significance"].apply(_is_true_text)
+
+    # ABE-significant sites first, then highest avg reads, then lowest edit distance.
     df = df.sort_values(
-        by=["CSEQ_avg_reads", "CSEQ_edit_distance", "__cust_input_order__"],
-        ascending=[False, True, True],
+        by=["CSEQ_abe_true", "CSEQ_avg_reads", "CSEQ_edit_distance", "__cust_input_order__"],
+        ascending=[False, False, True, True],
         kind="mergesort",
     ).reset_index(drop=True)
     df["__cust_input_order__"] = range(1, len(df) + 1)
@@ -376,6 +383,7 @@ class Component:
     avg_pct_on_target_umi: Optional[str] = None
     cseq_avg_reads: Optional[str] = None
     cseq_edit_distance: Optional[str] = None
+    abe_stats_significance: Optional[str] = None
 
     def display_token(self) -> str:
         """Human-friendly component token per source for mapping file."""
@@ -422,6 +430,7 @@ class Record:
     cust_min_order: Optional[int] = None
     cust_avg_reads_max: Optional[float] = None
     cust_edit_distance_min: Optional[float] = None
+    customer_abe_significant: bool = False
     # In-silico
     ins_pop_present: bool = False
     ins_pop_index: Optional[int] = None
@@ -558,6 +567,10 @@ def merge_sources(df_customer: pd.DataFrame,
             comp.cust_name = _sanitize_name(row.get("cust_name", ""))
             comp.cust_nonon_index = cust_nonon_idx
             comp.cust_input_order = cin
+            abe_sig = str(row.get("ABE_STATS_significance", "") or "")
+            comp.abe_stats_significance = abe_sig if abe_sig.strip() else None
+            if _is_true_text(abe_sig):
+                rec.customer_abe_significant = True
 
         elif label in ("insilico_pop","insilico_ref"):
             is_pop = (label == "insilico_pop")
@@ -689,6 +702,7 @@ def _recompute_aggregates_from_components(r: "Record") -> None:
     cust_edit = [_safe_float(c.cseq_edit_distance, None) for c in comps if c.source == "customer"]
     cust_edit = [v for v in cust_edit if v is not None]
     r.cust_edit_distance_min = min(cust_edit) if cust_edit else None
+    r.customer_abe_significant = any(_is_true_text(c.abe_stats_significance) for c in comps if c.source == "customer")
     # In-silico
     r.ins_pop_present = any(c.source == "insilico_pop" for c in comps)
     r.ins_ref_present = any(c.source == "insilico_ref" for c in comps)
@@ -831,15 +845,28 @@ def prioritize(all_recs: List[Record], max_sites: int):
 
     # 1) CHANGEseq-BE block (60)
     cust_block = [r for r in all_recs if r.customer_present]
+    cust_sort_key = lambda r: (
+        0 if r.customer_abe_significant else 1,
+        -(r.cust_avg_reads_max if r.cust_avg_reads_max is not None else -1e9),
+        (r.cust_edit_distance_min if r.cust_edit_distance_min is not None else 1e9),
+        (r.cust_min_order if r.cust_min_order is not None else 10**12),
+    )
     add_in_order(
         cust_block,
-        key=lambda r: (
-            -(r.cust_avg_reads_max if r.cust_avg_reads_max is not None else -1e9),
-            (r.cust_edit_distance_min if r.cust_edit_distance_min is not None else 1e9),
-            (r.cust_min_order if r.cust_min_order is not None else 10**12),
-        ),
+        key=cust_sort_key,
         limit=60,
     )
+
+    # Exception: include any remaining ABE-significant customer sites beyond the 60 cap.
+    remaining_true_cust = [
+        r for r in cust_block
+        if r.customer_abe_significant and (r.chr, r.start, r.stop, r.strand) not in seen
+    ]
+    add_in_order(
+        remaining_true_cust,
+        key=cust_sort_key,
+    )
+
     if len(selected) >= max_sites:
         return selected, []
 
@@ -873,6 +900,7 @@ def prioritize(all_recs: List[Record], max_sites: int):
     all_by_source_order = []
     all_by_source_order.extend(sorted([r for r in all_recs if r.customer_present],
                                       key=lambda r: (
+                                          0 if r.customer_abe_significant else 1,
                                           -(r.cust_avg_reads_max if r.cust_avg_reads_max is not None else -1e9),
                                           (r.cust_edit_distance_min if r.cust_edit_distance_min is not None else 1e9),
                                           (r.cust_min_order if r.cust_min_order is not None else 10**12),
@@ -1061,6 +1089,7 @@ def write_assay_mapping(path: str, recs: List[Record]) -> int:
         "Name","Location","Lev. Dist.","Gene","Annot.","Pool",
         "MAR","Tier","Tier_Final","Site Type","Origin","Avg. % On-Target UMI",
         "CHANGEseq-BE avg reads","CHANGEseq-BE Edit_distance",
+        "ABE_STATS_significance",
         "orig_chr","orig_start","orig_stop","orig_strand","orig_Name",
     ]
     n = 0
@@ -1088,6 +1117,7 @@ def write_assay_mapping(path: str, recs: List[Record]) -> int:
             avg_pct    = [c.avg_pct_on_target_umi for c in comps]
             cseq_avg   = [c.cseq_avg_reads for c in comps if c.source == "customer"]
             cseq_ed    = [c.cseq_edit_distance for c in comps if c.source == "customer"]
+            abe_sig    = [c.abe_stats_significance for c in comps if c.source == "customer"]
             # Original coords
             o_chr      = [c.orig_chr   for c in comps]
             o_start    = [str(c.orig_start) if c.orig_start is not None else None for c in comps]
@@ -1110,6 +1140,7 @@ def write_assay_mapping(path: str, recs: List[Record]) -> int:
                 _semi_join(avg_pct),
                 _semi_join(cseq_avg if cseq_avg else [None]),
                 _semi_join(cseq_ed if cseq_ed else [None]),
+                _semi_join(abe_sig if abe_sig else [None]),
                 _semi_join(o_chr),
                 _semi_join(o_start),
                 _semi_join(o_stop),
